@@ -1,0 +1,8 @@
+{
+  "name": "Lumina Meet",
+  "description": "A professional video conferencing platform with AI-powered automated minute-taking and real-time transcription.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ]
+}
