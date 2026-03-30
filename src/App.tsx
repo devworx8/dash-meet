@@ -23,14 +23,24 @@ import {
   RefreshCw,
   Pin,
   PinOff,
-  LogOut
+  LogOut,
+  Clock,
+  XCircle,
+  UserPlus,
+  X,
+  BarChart3,
+  Plus,
+  Trash2,
+  CreditCard,
+  Zap,
+  ShieldCheck
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import io from 'socket.io-client';
 import Peer from 'simple-peer';
 import { cn } from './lib/utils';
 import { generateMeetingMinutes } from './services/aiService';
-import { Message, MeetingMinutes } from './types';
+import { Message, MeetingMinutes, Poll, UserTier } from './types';
 
 const socket = io({
   transports: ['websocket'],
@@ -41,8 +51,15 @@ const socket = io({
 export default function App() {
   const [inMeeting, setInMeeting] = useState(false);
   const [roomId, setRoomId] = useState('');
+  const [userName, setUserName] = useState(localStorage.getItem('userName') || '');
   const [stream, setStream] = useState<MediaStream | null>(null);
-  const [peers, setPeers] = useState<any[]>([]);
+  const [peers, setPeers] = useState<{ 
+    peerId: string, 
+    peer: any, 
+    name: string,
+    isMuted: boolean,
+    isVideoOff: boolean
+  }[]>([]);
   const [messages, setMessages] = useState<Message[]>([]);
   const [inputText, setInputText] = useState('');
   const [showChat, setShowChat] = useState(false);
@@ -69,6 +86,16 @@ export default function App() {
   const [isAdvancedAudio, setIsAdvancedAudio] = useState(false);
   const [isHost, setIsHost] = useState(false);
   const [currentPage, setCurrentPage] = useState(0);
+  const [isInWaitingRoom, setIsInWaitingRoom] = useState(false);
+  const [waitingUsers, setWaitingUsers] = useState<{ id: string, name: string }[]>([]);
+  const [isRejected, setIsRejected] = useState(false);
+  const [userTier, setUserTier] = useState<UserTier>('free');
+  const [aiUsageCount, setAiUsageCount] = useState(0);
+  const [showUpgradeModal, setShowUpgradeModal] = useState(false);
+  const [polls, setPolls] = useState<Poll[]>([]);
+  const [showPolls, setShowPolls] = useState(false);
+  const [newPollQuestion, setNewPollQuestion] = useState('');
+  const [newPollOptions, setNewPollOptions] = useState(['', '']);
   const [confirmDialog, setConfirmDialog] = useState<{
     title: string;
     message: string;
@@ -300,22 +327,28 @@ export default function App() {
           });
         }
 
-        socket.emit('join-room', roomId);
+        socket.emit('join-room', { roomId, name: userName || `User ${socket.id?.substring(0, 4)}` });
 
-        socket.on('all-users', (users: string[]) => {
+        socket.on('all-users', (users: { id: string, name: string, isMuted?: boolean, isVideoOff?: boolean }[]) => {
           const peers: any[] = [];
-          users.forEach((userId) => {
+          users.forEach((user) => {
             // Check if peer already exists
-            if (peersRef.current.find(p => p.peerId === userId)) return;
+            if (peersRef.current.find(p => p.peerId === user.id)) return;
 
-            const peer = createPeer(userId, socket.id!, currentStream);
+            const peer = createPeer(user.id, socket.id!, currentStream);
             peersRef.current.push({
-              peerId: userId,
+              peerId: user.id,
               peer,
+              name: user.name,
+              isMuted: user.isMuted || false,
+              isVideoOff: user.isVideoOff || false
             });
             peers.push({
-              peerId: userId,
+              peerId: user.id,
               peer,
+              name: user.name,
+              isMuted: user.isMuted || false,
+              isVideoOff: user.isVideoOff || false
             });
           });
           setPeers(prev => {
@@ -323,6 +356,14 @@ export default function App() {
             const newPeers = peers.filter(p => !existingIds.has(p.peerId));
             return [...prev, ...newPeers];
           });
+        });
+
+        socket.on('remote-user-state-update', (payload: { userId: string, isMuted: boolean, isVideoOff: boolean }) => {
+          setPeers(prev => prev.map(p => 
+            p.peerId === payload.userId 
+              ? { ...p, isMuted: payload.isMuted, isVideoOff: payload.isVideoOff }
+              : p
+          ));
         });
 
         socket.on('user-joined', (payload: any) => {
@@ -333,8 +374,17 @@ export default function App() {
           peersRef.current.push({
             peerId: payload.callerId,
             peer,
+            name: payload.name,
+            isMuted: payload.isMuted || false,
+            isVideoOff: payload.isVideoOff || false
           });
-          setPeers((prev) => [...prev, { peerId: payload.callerId, peer }]);
+          setPeers((prev) => [...prev, { 
+            peerId: payload.callerId, 
+            peer, 
+            name: payload.name,
+            isMuted: payload.isMuted || false,
+            isVideoOff: payload.isVideoOff || false
+          }]);
         });
 
         socket.on('receiving-returned-signal', (payload: any) => {
@@ -394,8 +444,32 @@ export default function App() {
           }
         });
 
-        socket.on('room-info', ({ hostId }: { hostId: string }) => {
+        socket.on('room-info', ({ hostId, status }: { hostId: string, status?: 'waiting' | 'joined' }) => {
           setIsHost(socket.id === hostId);
+          if (status === 'waiting') {
+            setIsInWaitingRoom(true);
+          } else if (status === 'joined') {
+            setIsInWaitingRoom(false);
+          }
+        });
+
+        socket.on('waiting-room-update', (users: { id: string, name: string }[]) => {
+          setWaitingUsers(users);
+        });
+
+        socket.on('user-admitted', ({ roomId }: { roomId: string }) => {
+          setIsInWaitingRoom(false);
+          socket.emit('complete-join', roomId);
+        });
+
+        socket.on('user-rejected', () => {
+          setIsInWaitingRoom(false);
+          setIsRejected(true);
+          setInMeeting(false);
+        });
+
+        socket.on('polls-update', (updatedPolls: Poll[]) => {
+          setPolls(updatedPolls);
         });
 
         // Setup Speech Recognition for transcription
@@ -522,6 +596,12 @@ export default function App() {
     setRoomId(newId);
   };
 
+  useEffect(() => {
+    if (inMeeting && roomId) {
+      socket.emit('user-state-update', { roomId, isMuted, isVideoOff });
+    }
+  }, [isMuted, isVideoOff, inMeeting, roomId]);
+
   const toggleMute = () => {
     if (stream && stream.getAudioTracks().length > 0) {
       const track = stream.getAudioTracks()[0];
@@ -585,6 +665,34 @@ export default function App() {
     const newState = !isHandRaised;
     setIsHandRaised(newState);
     socket.emit('hand-raise', { roomId, isHandRaised: newState });
+  };
+
+  const admitUser = (userId: string) => {
+    socket.emit('admit-user', { roomId, userId });
+  };
+
+  const rejectUser = (userId: string) => {
+    socket.emit('reject-user', { roomId, userId });
+  };
+
+  const createPoll = () => {
+    if (newPollQuestion.trim() && newPollOptions.every(opt => opt.trim())) {
+      socket.emit('create-poll', { roomId, question: newPollQuestion, options: newPollOptions });
+      setNewPollQuestion('');
+      setNewPollOptions(['', '']);
+    }
+  };
+
+  const voteOnPoll = (pollId: string, optionIndex: number) => {
+    socket.emit('vote', { roomId, pollId, optionIndex });
+  };
+
+  const endPoll = (pollId: string) => {
+    socket.emit('end-poll', { roomId, pollId });
+  };
+
+  const deletePoll = (pollId: string) => {
+    socket.emit('delete-poll', { roomId, pollId });
   };
 
   const muteAll = () => {
@@ -750,11 +858,24 @@ export default function App() {
 
   const handleGenerateMinutes = async () => {
     if (!transcript) return;
+
+    // Check usage limits based on tier
+    if (userTier === 'free' && aiUsageCount >= 3) {
+      setShowUpgradeModal(true);
+      return;
+    }
+
     setIsGenerating(true);
-    const result = await generateMeetingMinutes(transcript);
-    setMinutes(result);
-    setIsGenerating(false);
-    setShowAI(true);
+    try {
+      const result = await generateMeetingMinutes(transcript);
+      setMinutes(result);
+      setAiUsageCount(prev => prev + 1);
+      setShowAI(true);
+    } catch (error) {
+      console.error("Failed to generate minutes:", error);
+    } finally {
+      setIsGenerating(false);
+    }
   };
 
   const copyRoomId = () => {
@@ -773,6 +894,69 @@ export default function App() {
     const secs = seconds % 60;
     return `${mins}:${secs.toString().padStart(2, '0')}`;
   };
+
+  if (isInWaitingRoom) {
+    return (
+      <div className="min-h-screen bg-[#050505] text-white flex items-center justify-center p-6 font-sans">
+        <motion.div 
+          initial={{ opacity: 0, scale: 0.9 }}
+          animate={{ opacity: 1, scale: 1 }}
+          className="max-w-md w-full bg-gray-900/50 backdrop-blur-xl border border-white/10 p-8 rounded-3xl text-center space-y-6 shadow-2xl"
+        >
+          <div className="relative w-20 h-20 mx-auto">
+            <div className="absolute inset-0 bg-blue-500/20 rounded-full animate-ping" />
+            <div className="relative w-20 h-20 bg-blue-600 rounded-full flex items-center justify-center">
+              <Clock className="w-10 h-10 text-white" />
+            </div>
+          </div>
+          <div className="space-y-2">
+            <h2 className="text-2xl font-bold">Waiting Room</h2>
+            <p className="text-gray-400 text-sm leading-relaxed">
+              The meeting host has been notified. Please wait a moment while they admit you to the call.
+            </p>
+          </div>
+          <div className="pt-4">
+            <button 
+              onClick={handleLeave}
+              className="px-6 py-2 text-sm font-medium text-gray-400 hover:text-white transition-colors"
+            >
+              Cancel and Leave
+            </button>
+          </div>
+        </motion.div>
+      </div>
+    );
+  }
+
+  if (isRejected) {
+    return (
+      <div className="min-h-screen bg-[#050505] text-white flex items-center justify-center p-6 font-sans">
+        <motion.div 
+          initial={{ opacity: 0, scale: 0.9 }}
+          animate={{ opacity: 1, scale: 1 }}
+          className="max-w-md w-full bg-red-900/10 backdrop-blur-xl border border-red-500/20 p-8 rounded-3xl text-center space-y-6 shadow-2xl"
+        >
+          <div className="w-20 h-20 bg-red-600 rounded-full flex items-center justify-center mx-auto">
+            <XCircle className="w-10 h-10 text-white" />
+          </div>
+          <div className="space-y-2">
+            <h2 className="text-2xl font-bold">Access Denied</h2>
+            <p className="text-gray-400 text-sm leading-relaxed">
+              The host has declined your request to join this meeting.
+            </p>
+          </div>
+          <div className="pt-4">
+            <button 
+              onClick={() => setIsRejected(false)}
+              className="w-full py-3 bg-gray-800 hover:bg-gray-700 rounded-xl font-semibold transition-all"
+            >
+              Back to Home
+            </button>
+          </div>
+        </motion.div>
+      </div>
+    );
+  }
 
   if (!inMeeting) {
     return (
@@ -876,6 +1060,28 @@ export default function App() {
                   <span className="w-full border-t border-gray-800"></span>
                 </div>
                 <div className="relative flex justify-center text-xs uppercase">
+                  <span className="bg-[#0a0a0a] px-2 text-gray-500">Your Identity</span>
+                </div>
+              </div>
+
+              <div className="space-y-3">
+                <input 
+                  type="text" 
+                  placeholder="Your Name"
+                  value={userName}
+                  onChange={(e) => {
+                    setUserName(e.target.value);
+                    localStorage.setItem('userName', e.target.value);
+                  }}
+                  className="w-full bg-gray-900 border border-gray-800 rounded-xl px-4 py-3 focus:outline-none focus:ring-2 focus:ring-blue-500 transition-all"
+                />
+              </div>
+
+              <div className="relative">
+                <div className="absolute inset-0 flex items-center">
+                  <span className="w-full border-t border-gray-800"></span>
+                </div>
+                <div className="relative flex justify-center text-xs uppercase">
                   <span className="bg-[#0a0a0a] px-2 text-gray-500">Or join with a code</span>
                 </div>
               </div>
@@ -903,7 +1109,7 @@ export default function App() {
   }
 
   return (
-    <div className="h-screen bg-[#050505] text-white flex flex-col overflow-hidden font-sans">
+    <div className="h-screen bg-[#050505] text-white flex flex-col overflow-hidden font-sans pt-safe pl-safe pr-safe">
       {/* Header */}
       <header className="h-14 md:h-16 border-b border-gray-900 flex items-center justify-between px-4 md:px-6 bg-[#0a0a0a]/80 backdrop-blur-md z-10">
         <div className="flex items-center gap-2 md:gap-4">
@@ -940,7 +1146,30 @@ export default function App() {
             <RefreshCw className="w-5 h-5" />
           </button>
           <button 
-            onClick={() => setShowChat(!showChat)}
+            onClick={() => {
+              setShowPolls(!showPolls);
+              setShowChat(false);
+              setShowAI(false);
+              setShowParticipants(false);
+            }}
+            className={cn(
+              "p-2 rounded-lg transition-all relative",
+              showPolls ? "bg-blue-600 text-white" : "hover:bg-gray-800 text-gray-400"
+            )}
+            title="Polls"
+          >
+            <BarChart3 className="w-5 h-5" />
+            {polls.some(p => p.active) && !showPolls && (
+              <span className="absolute top-1 right-1 w-2 h-2 bg-blue-500 rounded-full animate-pulse" />
+            )}
+          </button>
+          <button 
+            onClick={() => {
+              setShowChat(!showChat);
+              setShowPolls(false);
+              setShowAI(false);
+              setShowParticipants(false);
+            }}
             className={cn(
               "p-2 rounded-lg transition-all relative",
               showChat ? "bg-blue-600 text-white" : "hover:bg-gray-800 text-gray-400"
@@ -952,7 +1181,12 @@ export default function App() {
             )}
           </button>
           <button 
-            onClick={() => setShowAI(!showAI)}
+            onClick={() => {
+              setShowAI(!showAI);
+              setShowChat(false);
+              setShowPolls(false);
+              setShowParticipants(false);
+            }}
             className={cn(
               "p-2 rounded-lg transition-all",
               showAI ? "bg-purple-600 text-white" : "hover:bg-gray-800 text-gray-400"
@@ -961,7 +1195,12 @@ export default function App() {
             <Sparkles className="w-5 h-5" />
           </button>
           <button 
-            onClick={() => setShowParticipants(!showParticipants)}
+            onClick={() => {
+              setShowParticipants(!showParticipants);
+              setShowChat(false);
+              setShowPolls(false);
+              setShowAI(false);
+            }}
             className={cn(
               "p-2 rounded-lg transition-all",
               showParticipants ? "bg-blue-600 text-white" : "hover:bg-gray-800 text-gray-400"
@@ -995,8 +1234,11 @@ export default function App() {
                 peers.find(p => p.peerId === pinnedParticipantId) ? (
                   <VideoCard 
                     key={pinnedParticipantId} 
-                    peer={peers.find(p => p.peerId === pinnedParticipantId).peer} 
+                    peer={peers.find(p => p.peerId === pinnedParticipantId)!.peer} 
                     peerId={pinnedParticipantId} 
+                    name={peers.find(p => p.peerId === pinnedParticipantId)!.name}
+                    isMuted={peers.find(p => p.peerId === pinnedParticipantId)!.isMuted}
+                    isVideoOff={peers.find(p => p.peerId === pinnedParticipantId)!.isVideoOff}
                     isHandRaised={raisedHands.has(pinnedParticipantId)}
                     isPinned={true}
                     onPin={() => setPinnedParticipantId(null)}
@@ -1010,8 +1252,8 @@ export default function App() {
                 <>
                   {(() => {
                     const allParticipants = [
-                      { id: 'me', isMe: true },
-                      ...peers.map(p => ({ id: p.peerId, isMe: false, peer: p.peer }))
+                      { id: 'me', isMe: true, name: userName || 'You', isMuted, isVideoOff },
+                      ...peers.map(p => ({ id: p.peerId, isMe: false, peer: p.peer, name: p.name, isMuted: p.isMuted, isVideoOff: p.isVideoOff }))
                     ];
                     const itemsPerPage = 9;
                     const totalPages = Math.ceil(allParticipants.length / itemsPerPage);
@@ -1030,16 +1272,26 @@ export default function App() {
                                 playsInline 
                                 className={cn("w-full h-full object-cover", isVideoOff && "hidden")} 
                               />
+                              
+                              {/* Name Overlay for Me */}
+                              <div className="absolute bottom-2 left-2 md:bottom-4 md:left-4 z-10">
+                                <div className="px-2 py-1 md:px-3 md:py-1.5 bg-black/40 backdrop-blur-md border border-white/10 rounded-xl flex items-center gap-2 shadow-lg">
+                                  <span className="text-[10px] md:text-xs font-bold text-white truncate max-w-[100px] md:max-w-[150px]">
+                                    {userName || 'You'}
+                                  </span>
+                                  {isMuted && (
+                                    <MicOff className="w-3 h-3 text-red-500" />
+                                  )}
+                                </div>
+                              </div>
+
                               {isVideoOff && (
                                 <div className="absolute inset-0 flex items-center justify-center bg-gray-900">
                                   <div className="w-24 h-24 rounded-full bg-gray-800 flex items-center justify-center text-3xl font-bold">
-                                    You
+                                    {(userName || 'Y').substring(0, 1).toUpperCase()}
                                   </div>
                                 </div>
                               )}
-                              <div className="absolute bottom-4 left-4 bg-black/50 backdrop-blur-md px-3 py-1 rounded-lg text-xs font-medium border border-white/10">
-                                You {isMuted && "(Muted)"}
-                              </div>
                               {isHandRaised && (
                                 <div className="absolute top-4 right-4 bg-yellow-500 text-black p-2 rounded-full shadow-lg animate-bounce">
                                   <Hand className="w-4 h-4" />
@@ -1051,6 +1303,9 @@ export default function App() {
                               key={item.id} 
                               peer={(item as any).peer} 
                               peerId={item.id} 
+                              name={(item as any).name}
+                              isMuted={(item as any).isMuted}
+                              isVideoOff={(item as any).isVideoOff}
                               isHandRaised={raisedHands.has(item.id)}
                               isPinned={false}
                               onPin={() => setPinnedParticipantId(item.id)}
@@ -1115,6 +1370,9 @@ export default function App() {
                   key={peerObj.peerId} 
                   peer={peerObj.peer} 
                   peerId={peerObj.peerId} 
+                  name={peerObj.name}
+                  isMuted={peerObj.isMuted}
+                  isVideoOff={peerObj.isVideoOff}
                   isHandRaised={raisedHands.has(peerObj.peerId)}
                   isPinned={false}
                   onPin={() => setPinnedParticipantId(peerObj.peerId)}
@@ -1144,6 +1402,162 @@ export default function App() {
 
         {/* Side Panels */}
         <AnimatePresence>
+          {showPolls && (
+            <motion.aside 
+              initial={{ x: '100%' }}
+              animate={{ x: 0 }}
+              exit={{ x: '100%' }}
+              className="fixed inset-0 lg:relative lg:inset-auto lg:w-96 border-l border-gray-900 bg-[#0a0a0a] flex flex-col shadow-2xl z-50"
+            >
+              <div className="p-4 border-b border-gray-900 flex items-center justify-between">
+                <h3 className="font-bold flex items-center gap-2">
+                  <BarChart3 className="w-4 h-4 text-blue-500" />
+                  Polls
+                </h3>
+                <button onClick={() => setShowPolls(false)} className="p-2 text-gray-500 hover:text-white text-2xl">×</button>
+              </div>
+
+              <div className="flex-1 overflow-y-auto p-4 space-y-6 pb-safe">
+                {isHost && (
+                  <div className="p-4 bg-blue-900/10 border border-blue-500/20 rounded-2xl space-y-4">
+                    <h4 className="text-sm font-bold text-blue-400 uppercase tracking-widest">Create New Poll</h4>
+                    <div className="space-y-3">
+                      <input 
+                        type="text" 
+                        placeholder="Question" 
+                        value={newPollQuestion}
+                        onChange={(e) => setNewPollQuestion(e.target.value)}
+                        className="w-full bg-gray-900 border border-gray-800 rounded-xl px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500 outline-none"
+                      />
+                      {newPollOptions.map((opt, idx) => (
+                        <div key={idx} className="flex gap-2">
+                          <input 
+                            type="text" 
+                            placeholder={`Option ${idx + 1}`} 
+                            value={opt}
+                            onChange={(e) => {
+                              const newOpts = [...newPollOptions];
+                              newOpts[idx] = e.target.value;
+                              setNewPollOptions(newOpts);
+                            }}
+                            className="flex-1 bg-gray-900 border border-gray-800 rounded-xl px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500 outline-none"
+                          />
+                          {newPollOptions.length > 2 && (
+                            <button 
+                              onClick={() => setNewPollOptions(newPollOptions.filter((_, i) => i !== idx))}
+                              className="p-2 text-red-500 hover:bg-red-500/10 rounded-lg"
+                            >
+                              <X className="w-4 h-4" />
+                            </button>
+                          )}
+                        </div>
+                      ))}
+                      <button 
+                        onClick={() => setNewPollOptions([...newPollOptions, ''])}
+                        className="w-full py-2 border border-dashed border-gray-700 rounded-xl text-xs text-gray-500 hover:text-gray-300 hover:border-gray-500 transition-all flex items-center justify-center gap-2"
+                      >
+                        <Plus className="w-3 h-3" /> Add Option
+                      </button>
+                      <button 
+                        onClick={createPoll}
+                        disabled={!newPollQuestion.trim() || newPollOptions.some(o => !o.trim())}
+                        className="w-full py-2 bg-blue-600 hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed rounded-xl text-sm font-bold transition-all"
+                      >
+                        Launch Poll
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                <div className="space-y-4">
+                  {polls.length === 0 ? (
+                    <div className="text-center py-12 space-y-3">
+                      <div className="w-12 h-12 bg-gray-900 rounded-full flex items-center justify-center mx-auto">
+                        <BarChart3 className="w-6 h-6 text-gray-700" />
+                      </div>
+                      <p className="text-sm text-gray-500">No polls have been created yet.</p>
+                    </div>
+                  ) : (
+                    polls.slice().reverse().map((poll) => {
+                      const totalVotes = Object.values(poll.votes).length;
+                      const userVote = poll.votes[socket.id!];
+
+                      return (
+                        <div key={poll.id} className="p-4 bg-gray-900/50 border border-gray-800 rounded-2xl space-y-4">
+                          <div className="flex items-start justify-between gap-2">
+                            <h5 className="font-bold text-sm leading-tight">{poll.question}</h5>
+                            {isHost && (
+                              <div className="flex gap-1">
+                                {poll.active && (
+                                  <button 
+                                    onClick={() => endPoll(poll.id)}
+                                    className="p-1.5 text-amber-500 hover:bg-amber-500/10 rounded-lg text-[10px] font-bold uppercase"
+                                  >
+                                    End
+                                  </button>
+                                )}
+                                <button 
+                                  onClick={() => deletePoll(poll.id)}
+                                  className="p-1.5 text-red-500 hover:bg-red-500/10 rounded-lg"
+                                >
+                                  <Trash2 className="w-3.5 h-3.5" />
+                                </button>
+                              </div>
+                            )}
+                          </div>
+
+                          <div className="space-y-2">
+                            {poll.options.map((opt, idx) => {
+                              const voteCount = Object.values(poll.votes).filter(v => v === idx).length;
+                              const percentage = totalVotes > 0 ? Math.round((voteCount / totalVotes) * 100) : 0;
+                              
+                              return (
+                                <button 
+                                  key={idx}
+                                  disabled={!poll.active || userVote !== undefined}
+                                  onClick={() => voteOnPoll(poll.id, idx)}
+                                  className={cn(
+                                    "w-full relative h-10 rounded-xl overflow-hidden border transition-all text-left px-3",
+                                    userVote === idx 
+                                      ? "border-blue-500 bg-blue-500/10" 
+                                      : "border-gray-800 bg-gray-900/50 hover:border-gray-700"
+                                  )}
+                                >
+                                  <motion.div 
+                                    initial={{ width: 0 }}
+                                    animate={{ width: `${percentage}%` }}
+                                    className="absolute inset-y-0 left-0 bg-blue-500/10"
+                                  />
+                                  <div className="relative flex items-center justify-between h-full text-xs">
+                                    <span className={cn(
+                                      "font-medium truncate pr-8",
+                                      userVote === idx ? "text-blue-400" : "text-gray-300"
+                                    )}>
+                                      {opt}
+                                    </span>
+                                    <span className="text-[10px] font-bold text-gray-500">{percentage}%</span>
+                                  </div>
+                                </button>
+                              );
+                            })}
+                          </div>
+
+                          <div className="flex items-center justify-between text-[10px] text-gray-500 font-bold uppercase tracking-widest">
+                            <span>{totalVotes} votes</span>
+                            <span className={cn(
+                              poll.active ? "text-green-500" : "text-red-500"
+                            )}>
+                              {poll.active ? 'Active' : 'Ended'}
+                            </span>
+                          </div>
+                        </div>
+                      );
+                    })
+                  )}
+                </div>
+              </div>
+            </motion.aside>
+          )}
           {showChat && (
             <motion.aside 
               initial={{ x: '100%' }}
@@ -1173,7 +1587,7 @@ export default function App() {
                   </div>
                 ))}
               </div>
-              <form onSubmit={sendMessage} className="p-4 pb-8 lg:pb-4 border-t border-gray-900 flex gap-2">
+              <form onSubmit={sendMessage} className="p-4 pb-8 lg:pb-4 border-t border-gray-900 flex gap-2 pb-safe">
                 <input 
                   type="text" 
                   placeholder="Send a message..."
@@ -1200,10 +1614,38 @@ export default function App() {
                   <Sparkles className="w-4 h-4 text-purple-400" />
                   <h3 className="font-semibold">AI Assistant</h3>
                 </div>
-                <button onClick={() => setShowAI(false)} className="p-2 text-gray-500 hover:text-white text-2xl">×</button>
+                <div className="flex items-center gap-3">
+                  {userTier === 'free' && (
+                    <button 
+                      onClick={() => setShowUpgradeModal(true)}
+                      className="px-2 py-1 bg-gradient-to-r from-amber-500 to-orange-600 text-[10px] font-bold text-white rounded-full shadow-lg shadow-amber-500/20"
+                    >
+                      UPGRADE
+                    </button>
+                  )}
+                  <button onClick={() => setShowAI(false)} className="p-2 text-gray-500 hover:text-white text-2xl">×</button>
+                </div>
               </div>
               
-              <div className="flex-1 overflow-y-auto p-4 space-y-6 pb-20 lg:pb-4">
+              <div className="flex-1 overflow-y-auto p-4 space-y-6 pb-20 lg:pb-4 pb-safe">
+                {userTier === 'free' && (
+                  <div className="px-3 py-2 bg-gray-900 border border-gray-800 rounded-xl flex items-center justify-between">
+                    <span className="text-[10px] font-bold text-gray-500 uppercase tracking-widest">AI Usage</span>
+                    <div className="flex items-center gap-2">
+                      <div className="w-24 h-1.5 bg-gray-800 rounded-full overflow-hidden">
+                        <motion.div 
+                          initial={{ width: 0 }}
+                          animate={{ width: `${(aiUsageCount / 3) * 100}%` }}
+                          className={cn(
+                            "h-full rounded-full",
+                            aiUsageCount >= 3 ? "bg-red-500" : "bg-purple-500"
+                          )}
+                        />
+                      </div>
+                      <span className="text-[10px] font-bold text-gray-400">{aiUsageCount}/3</span>
+                    </div>
+                  </div>
+                )}
                 {!minutes ? (
                   <div className="space-y-4">
                     <div className="p-4 bg-purple-900/10 border border-purple-500/20 rounded-xl">
@@ -1318,7 +1760,40 @@ export default function App() {
                 </div>
               )}
 
-              <div className="flex-1 overflow-y-auto p-4 space-y-2">
+              <div className="flex-1 overflow-y-auto p-4 space-y-2 pb-safe">
+                {isHost && waitingUsers.length > 0 && (
+                  <div className="mb-6 space-y-2">
+                    <h4 className="text-[10px] font-bold text-blue-400 uppercase tracking-widest px-1">Waiting Room ({waitingUsers.length})</h4>
+                    {waitingUsers.map((user) => (
+                      <div key={user.id} className="flex items-center justify-between p-3 bg-blue-900/10 rounded-xl border border-blue-500/20 animate-in fade-in slide-in-from-right-4">
+                        <div className="flex items-center gap-3">
+                          <div className="w-8 h-8 rounded-full bg-blue-600/20 flex items-center justify-center text-xs font-bold text-blue-400 border border-blue-500/20">
+                            {user.name.substring(0, 2).toUpperCase()}
+                          </div>
+                          <span className="text-sm font-medium">{user.name}</span>
+                        </div>
+                        <div className="flex gap-1">
+                          <button 
+                            onClick={() => admitUser(user.id)}
+                            className="p-1.5 bg-blue-600 hover:bg-blue-700 rounded-lg transition-colors"
+                            title="Admit"
+                          >
+                            <UserPlus className="w-3.5 h-3.5" />
+                          </button>
+                          <button 
+                            onClick={() => rejectUser(user.id)}
+                            className="p-1.5 bg-red-600/20 hover:bg-red-600/40 rounded-lg transition-colors text-red-500"
+                            title="Reject"
+                          >
+                            <X className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                    <div className="h-px bg-gray-900 my-4" />
+                  </div>
+                )}
+
                 <div className="flex items-center justify-between p-3 bg-gray-900/50 rounded-xl border border-gray-800">
                   <div className="flex items-center gap-3">
                     <div className="w-8 h-8 rounded-full bg-blue-600 flex items-center justify-center text-xs font-bold">You</div>
@@ -1346,7 +1821,7 @@ export default function App() {
       </main>
 
       {/* Controls */}
-      <footer className="h-20 md:h-24 bg-[#0a0a0a] border-t border-gray-900 flex items-center justify-center px-4 md:px-6 gap-2 md:gap-4 z-10">
+      <footer className="h-20 md:h-24 bg-[#0a0a0a] border-t border-gray-900 flex items-center justify-center px-4 md:px-6 gap-2 md:gap-4 z-10 pb-safe">
         <div className="flex items-center gap-2 md:gap-3 lg:gap-4">
           <button 
             onClick={toggleMute}
@@ -1425,6 +1900,96 @@ export default function App() {
         </div>
       </footer>
 
+      {/* Upgrade Modal */}
+      <AnimatePresence>
+        {showUpgradeModal && (
+          <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm">
+            <motion.div 
+              initial={{ scale: 0.9, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              exit={{ scale: 0.9, opacity: 0 }}
+              className="w-full max-w-4xl bg-[#0a0a0a] border border-gray-800 rounded-3xl overflow-hidden shadow-2xl flex flex-col lg:flex-row"
+            >
+              {/* Left Side: Info */}
+              <div className="flex-1 p-8 lg:p-12 space-y-8 bg-gradient-to-br from-purple-900/20 to-transparent">
+                <div className="space-y-4">
+                  <div className="w-12 h-12 bg-purple-600 rounded-2xl flex items-center justify-center shadow-lg shadow-purple-500/20">
+                    <Zap className="w-6 h-6 text-white" />
+                  </div>
+                  <h2 className="text-3xl font-bold tracking-tight">Unlock Lumina Pro</h2>
+                  <p className="text-gray-400 leading-relaxed">
+                    Take your meetings to the next level with unlimited AI generation, 4K video quality, and advanced host controls.
+                  </p>
+                </div>
+
+                <div className="space-y-4">
+                  {[
+                    { icon: Sparkles, text: "Unlimited AI Meeting Minutes", color: "text-purple-400" },
+                    { icon: Monitor, text: "4K Ultra HD Video Quality", color: "text-blue-400" },
+                    { icon: ShieldCheck, text: "Advanced Security & Host Controls", color: "text-green-400" },
+                    { icon: Users, text: "Up to 100 Participants", color: "text-amber-400" }
+                  ].map((feature, i) => (
+                    <div key={i} className="flex items-center gap-4">
+                      <div className={cn("w-8 h-8 rounded-lg bg-gray-900 flex items-center justify-center border border-gray-800", feature.color)}>
+                        <feature.icon className="w-4 h-4" />
+                      </div>
+                      <span className="text-sm font-medium text-gray-300">{feature.text}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              {/* Right Side: Plans */}
+              <div className="w-full lg:w-[400px] p-8 lg:p-12 bg-gray-900/50 border-l border-gray-800 flex flex-col justify-between">
+                <div className="space-y-6">
+                  <div className="p-4 rounded-2xl border-2 border-purple-500 bg-purple-500/10 space-y-2">
+                    <div className="flex justify-between items-center">
+                      <span className="text-xs font-bold text-purple-400 uppercase tracking-widest">Pro Plan</span>
+                      <span className="px-2 py-0.5 bg-purple-500 text-[10px] font-bold text-white rounded-full">POPULAR</span>
+                    </div>
+                    <div className="flex items-baseline gap-1">
+                      <span className="text-3xl font-bold">$12</span>
+                      <span className="text-gray-500 text-sm">/month</span>
+                    </div>
+                    <p className="text-xs text-gray-400">Perfect for individuals and small teams.</p>
+                  </div>
+
+                  <div className="p-4 rounded-2xl border border-gray-800 bg-gray-900/50 space-y-2 opacity-60">
+                    <div className="flex justify-between items-center">
+                      <span className="text-xs font-bold text-gray-500 uppercase tracking-widest">Enterprise</span>
+                    </div>
+                    <div className="flex items-baseline gap-1">
+                      <span className="text-3xl font-bold">$49</span>
+                      <span className="text-gray-500 text-sm">/month</span>
+                    </div>
+                    <p className="text-xs text-gray-400">For large organizations with custom needs.</p>
+                  </div>
+                </div>
+
+                <div className="mt-8 space-y-4">
+                  <button 
+                    onClick={() => {
+                      setUserTier('pro');
+                      setShowUpgradeModal(false);
+                    }}
+                    className="w-full py-4 bg-white text-black hover:bg-gray-200 rounded-2xl font-bold transition-all flex items-center justify-center gap-2"
+                  >
+                    <CreditCard className="w-4 h-4" />
+                    Upgrade Now
+                  </button>
+                  <button 
+                    onClick={() => setShowUpgradeModal(false)}
+                    className="w-full py-2 text-sm text-gray-500 hover:text-white transition-colors"
+                  >
+                    Maybe later
+                  </button>
+                </div>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
       {/* Confirmation Dialog */}
       <AnimatePresence>
         {confirmDialog && (
@@ -1464,12 +2029,18 @@ export default function App() {
 function VideoCard({ 
   peer, 
   peerId, 
+  name,
+  isMuted,
+  isVideoOff,
   isHandRaised, 
   isPinned, 
   onPin 
 }: { 
   peer: any, 
   peerId: string, 
+  name?: string,
+  isMuted?: boolean,
+  isVideoOff?: boolean,
   isHandRaised?: boolean,
   isPinned: boolean,
   onPin: () => void
@@ -1478,6 +2049,9 @@ function VideoCard({
   const [hasStream, setHasStream] = useState(false);
   const [isLocalMuted, setIsLocalMuted] = useState(false);
   const [isLocalVideoOff, setIsLocalVideoOff] = useState(false);
+  
+  const effectiveMuted = isMuted || isLocalMuted;
+  const effectiveVideoOff = isVideoOff || isLocalVideoOff;
   const [showControls, setShowControls] = useState(false);
 
   useEffect(() => {
@@ -1513,15 +2087,30 @@ function VideoCard({
         ref={ref} 
         autoPlay 
         playsInline 
-        muted={isLocalMuted}
-        className={cn("w-full h-full object-cover pointer-events-none", (!hasStream || isLocalVideoOff) && "hidden")} 
+        muted={effectiveMuted}
+        className={cn("w-full h-full object-cover pointer-events-none", (!hasStream || effectiveVideoOff) && "hidden")} 
       />
+
+      {/* Name Overlay */}
+      <div className="absolute bottom-2 left-2 md:bottom-4 md:left-4 z-10">
+        <div className="px-2 py-1 md:px-3 md:py-1.5 bg-black/40 backdrop-blur-md border border-white/10 rounded-xl flex items-center gap-2 shadow-lg">
+          <span className="text-[10px] md:text-xs font-bold text-white truncate max-w-[100px] md:max-w-[150px]">
+            {name || `User ${peerId.substring(0, 4)}`}
+          </span>
+          {effectiveMuted && (
+            <MicOff className="w-3 h-3 text-red-500" />
+          )}
+          {isPinned && (
+            <Pin className="w-3 h-3 text-blue-400" />
+          )}
+        </div>
+      </div>
       
-      {(!hasStream || isLocalVideoOff) && (
+      {(!hasStream || effectiveVideoOff) && (
         <div className="absolute inset-0 flex items-center justify-center bg-gray-900 pointer-events-none">
           <div className="flex flex-col items-center gap-3">
             <div className="w-12 h-12 md:w-16 md:h-16 rounded-full bg-gray-800 flex items-center justify-center text-lg md:text-xl font-bold animate-pulse">
-              {peerId.substring(0, 2).toUpperCase()}
+              {(name || peerId).substring(0, 2).toUpperCase()}
             </div>
             <span className="text-[10px] md:text-xs text-gray-500 font-medium">
               {!hasStream ? "Connecting..." : "Video Paused"}
@@ -1568,12 +2157,6 @@ function VideoCard({
         >
           {isPinned ? <PinOff className="w-3.5 h-3.5 md:w-4 md:h-4" /> : <Pin className="w-3.5 h-3.5 md:w-4 md:h-4" />}
         </button>
-      </div>
-
-      <div className="absolute bottom-2 left-2 md:bottom-4 md:left-4 bg-black/50 backdrop-blur-md px-2 py-0.5 md:px-3 md:py-1 rounded-lg text-[10px] md:text-xs font-medium border border-white/10 flex items-center gap-1 md:gap-2 pointer-events-none">
-        <span className="truncate max-w-[80px] md:max-w-[100px]">User {peerId.substring(0, 4)}</span>
-        {isLocalMuted && <MicOff className="w-3 h-3 text-red-500" />}
-        {isPinned && <Pin className="w-3 h-3 text-blue-500" />}
       </div>
 
       {isHandRaised && (

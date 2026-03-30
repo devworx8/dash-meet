@@ -1,0 +1,21 @@
+{
+  "name": "Lumina Meet",
+  "short_name": "Lumina",
+  "description": "Professional video calls with AI-powered minutes.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#050505",
+  "theme_color": "#2563eb",
+  "icons": [
+    {
+      "src": "https://picsum.photos/seed/lumina/192/192",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "https://picsum.photos/seed/lumina/512/512",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ]
+}
