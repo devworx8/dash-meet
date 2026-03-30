@@ -14,7 +14,16 @@ import {
   Sparkles,
   LayoutGrid,
   Monitor,
-  MonitorOff
+  MonitorOff,
+  Hand,
+  Smile,
+  CircleDot,
+  Download,
+  StopCircle,
+  RefreshCw,
+  Pin,
+  PinOff,
+  LogOut
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import io from 'socket.io-client';
@@ -49,11 +58,163 @@ export default function App() {
   const [generatedLink, setGeneratedLink] = useState('');
   const [layout, setLayout] = useState<'grid' | 'focus'>('grid');
   const [isConnected, setIsConnected] = useState(socket.connected);
+  const [isRecording, setIsRecording] = useState(false);
+  const [isHandRaised, setIsHandRaised] = useState(false);
+  const [reactions, setReactions] = useState<{ id: number, emoji: string, userId: string }[]>([]);
+  const [raisedHands, setRaisedHands] = useState<Set<string>>(new Set());
+  const [pinnedParticipantId, setPinnedParticipantId] = useState<string | null>(null);
+  const [lastRoomId, setLastRoomId] = useState<string | null>(localStorage.getItem('lastRoomId'));
+  const [meetingStartTime, setMeetingStartTime] = useState<number | null>(null);
+  const [timeLeft, setTimeLeft] = useState<number>(40 * 60); // 40 minutes limit
+  const [isAdvancedAudio, setIsAdvancedAudio] = useState(false);
+  const [isHost, setIsHost] = useState(false);
+  const [currentPage, setCurrentPage] = useState(0);
+  const [confirmDialog, setConfirmDialog] = useState<{
+    title: string;
+    message: string;
+    onConfirm: () => void;
+  } | null>(null);
+  
   const screenStreamRef = useRef<MediaStream | null>(null);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const recordedChunksRef = useRef<Blob[]>([]);
 
   const userVideo = useRef<HTMLVideoElement>(null);
   const peersRef = useRef<any[]>([]);
   const recognitionRef = useRef<any>(null);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const audioSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const audioDestinationRef = useRef<MediaStreamAudioDestinationNode | null>(null);
+  const audioFilterRef = useRef<BiquadFilterNode | null>(null);
+  const audioCompressorRef = useRef<DynamicsCompressorNode | null>(null);
+
+  useEffect(() => {
+    if (inMeeting && roomId) {
+      const storedStartTime = localStorage.getItem(`meetingStart_${roomId}`);
+      if (storedStartTime) {
+        setMeetingStartTime(parseInt(storedStartTime));
+      } else {
+        const now = Date.now();
+        setMeetingStartTime(now);
+        localStorage.setItem(`meetingStart_${roomId}`, now.toString());
+      }
+    }
+  }, [inMeeting, roomId]);
+
+  useEffect(() => {
+    let timer: NodeJS.Timeout;
+    if (inMeeting && meetingStartTime) {
+      timer = setInterval(() => {
+        const elapsed = Math.floor((Date.now() - meetingStartTime) / 1000);
+        const remaining = Math.max(0, 40 * 60 - elapsed);
+        setTimeLeft(remaining);
+
+        if (remaining === 0) {
+          setConfirmDialog({
+            title: "Meeting Ended",
+            message: "This meeting has reached its 40-minute time limit.",
+            onConfirm: () => handleLeave()
+          });
+          clearInterval(timer);
+        } else if (remaining === 60) {
+          // 1 minute warning
+          setConfirmDialog({
+            title: "Meeting Ending Soon",
+            message: "This meeting will end in 1 minute due to the time limit.",
+            onConfirm: () => setConfirmDialog(null)
+          });
+        }
+      }, 1000);
+    }
+    return () => clearInterval(timer);
+  }, [inMeeting, meetingStartTime]);
+
+  useEffect(() => {
+    const itemsPerPage = 9;
+    const totalParticipants = peers.length + 1;
+    const totalPages = Math.ceil(totalParticipants / itemsPerPage);
+    if (currentPage >= totalPages && totalPages > 0) {
+      setCurrentPage(Math.max(0, totalPages - 1));
+    }
+  }, [peers.length, currentPage]);
+
+  const applyAdvancedAudio = (stream: MediaStream) => {
+    if (!isAdvancedAudio) return stream;
+
+    try {
+      if (!audioContextRef.current) {
+        audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
+      }
+      const ctx = audioContextRef.current;
+      
+      // Clean up previous nodes
+      if (audioSourceRef.current) audioSourceRef.current.disconnect();
+      if (audioFilterRef.current) audioFilterRef.current.disconnect();
+      if (audioCompressorRef.current) audioCompressorRef.current.disconnect();
+
+      const source = ctx.createMediaStreamSource(stream);
+      const destination = ctx.createMediaStreamDestination();
+      
+      // High-pass filter to remove low-end noise/rumble
+      const filter = ctx.createBiquadFilter();
+      filter.type = 'highpass';
+      filter.frequency.value = 150; // Cut off frequencies below 150Hz
+      
+      // Compressor to normalize volume and reduce peaks
+      const compressor = ctx.createDynamicsCompressor();
+      compressor.threshold.setValueAtTime(-24, ctx.currentTime);
+      compressor.knee.setValueAtTime(40, ctx.currentTime);
+      compressor.ratio.setValueAtTime(12, ctx.currentTime);
+      compressor.attack.setValueAtTime(0, ctx.currentTime);
+      compressor.release.setValueAtTime(0.25, ctx.currentTime);
+
+      source.connect(filter);
+      filter.connect(compressor);
+      compressor.connect(destination);
+
+      audioSourceRef.current = source;
+      audioFilterRef.current = filter;
+      audioCompressorRef.current = compressor;
+      audioDestinationRef.current = destination;
+
+      // Combine processed audio with original video
+      const processedStream = new MediaStream([
+        ...stream.getVideoTracks(),
+        ...destination.stream.getAudioTracks()
+      ]);
+
+      return processedStream;
+    } catch (err) {
+      console.error("Error applying advanced audio:", err);
+      return stream;
+    }
+  };
+
+  useEffect(() => {
+    if (stream && isAdvancedAudio) {
+      const processed = applyAdvancedAudio(stream);
+      // We don't update the main stream state here to avoid infinite loops,
+      // but we update the peers' tracks.
+      peersRef.current.forEach(({ peer }) => {
+        const oldAudioTrack = stream.getAudioTracks()[0];
+        const newAudioTrack = processed.getAudioTracks()[0];
+        if (oldAudioTrack && newAudioTrack) {
+          peer.replaceTrack(oldAudioTrack, newAudioTrack, stream);
+        }
+      });
+    } else if (stream && !isAdvancedAudio) {
+      // Revert to original audio
+      peersRef.current.forEach(({ peer }) => {
+        const audioTrack = stream.getAudioTracks()[0];
+        if (audioTrack) {
+          // Find the track currently being sent and replace it
+          // This is a bit tricky with simple-peer if we don't track the "current" track sent.
+          // But usually replacing with the original stream track works.
+          peer.replaceTrack(peer.streams[0].getAudioTracks()[0], audioTrack, stream);
+        }
+      });
+    }
+  }, [isAdvancedAudio]);
 
   useEffect(() => {
     const onConnect = () => {
@@ -80,6 +241,7 @@ export default function App() {
     if (roomParam) {
       setRoomId(roomParam);
       setInMeeting(true);
+      localStorage.setItem('lastRoomId', roomParam);
     }
   }, []);
 
@@ -99,8 +261,17 @@ export default function App() {
 
           if (hasVideo || hasAudio) {
             currentStream = await navigator.mediaDevices.getUserMedia({
-              video: hasVideo,
-              audio: hasAudio
+              video: hasVideo ? {
+                facingMode: 'user',
+                width: { ideal: 640 },
+                height: { ideal: 480 },
+                frameRate: { ideal: 24 }
+              } : false,
+              audio: hasAudio ? {
+                echoCancellation: true,
+                noiseSuppression: true,
+                autoGainControl: true
+              } : false
             });
             setIsVideoOff(!hasVideo);
             setIsMuted(!hasAudio);
@@ -134,6 +305,9 @@ export default function App() {
         socket.on('all-users', (users: string[]) => {
           const peers: any[] = [];
           users.forEach((userId) => {
+            // Check if peer already exists
+            if (peersRef.current.find(p => p.peerId === userId)) return;
+
             const peer = createPeer(userId, socket.id!, currentStream);
             peersRef.current.push({
               peerId: userId,
@@ -144,10 +318,17 @@ export default function App() {
               peer,
             });
           });
-          setPeers(peers);
+          setPeers(prev => {
+            const existingIds = new Set(prev.map(p => p.peerId));
+            const newPeers = peers.filter(p => !existingIds.has(p.peerId));
+            return [...prev, ...newPeers];
+          });
         });
 
         socket.on('user-joined', (payload: any) => {
+          // Check if peer already exists
+          if (peersRef.current.find(p => p.peerId === payload.callerId)) return;
+
           const peer = addPeer(payload.signal, payload.callerId, currentStream);
           peersRef.current.push({
             peerId: payload.callerId,
@@ -171,6 +352,50 @@ export default function App() {
 
         socket.on('new-message', (msg: Message) => {
           setMessages((prev) => [...prev, msg]);
+        });
+
+        socket.on('user-hand-raise', ({ userId, isHandRaised }: { userId: string, isHandRaised: boolean }) => {
+          setRaisedHands((prev) => {
+            const next = new Set(prev);
+            if (isHandRaised) {
+              next.add(userId);
+            } else {
+              next.delete(userId);
+            }
+            return next;
+          });
+        });
+
+        socket.on('new-reaction', ({ userId, emoji }: { userId: string, emoji: string }) => {
+          const id = Date.now();
+          setReactions((prev) => [...prev, { id, emoji, userId }]);
+          setTimeout(() => {
+            setReactions((prev) => prev.filter((r) => r.id !== id));
+          }, 3000);
+        });
+
+        socket.on('host-action', ({ action }: { action: 'mute-all' | 'stop-video-all' | 'end-meeting' }) => {
+          if (action === 'mute-all') {
+            setIsMuted(true);
+            if (stream) {
+              stream.getAudioTracks().forEach(track => track.enabled = false);
+            }
+          } else if (action === 'stop-video-all') {
+            setIsVideoOff(true);
+            if (stream) {
+              stream.getVideoTracks().forEach(track => track.enabled = false);
+            }
+          } else if (action === 'end-meeting') {
+            setConfirmDialog({
+              title: "Meeting Ended",
+              message: "The host has ended the meeting for everyone.",
+              onConfirm: () => handleLeave()
+            });
+          }
+        });
+
+        socket.on('room-info', ({ hostId }: { hostId: string }) => {
+          setIsHost(socket.id === hostId);
         });
 
         // Setup Speech Recognition for transcription
@@ -204,6 +429,8 @@ export default function App() {
       socket.off('receiving-returned-signal');
       socket.off('user-left');
       socket.off('new-message');
+      socket.off('user-hand-raise');
+      socket.off('new-reaction');
       if (recognitionRef.current) recognitionRef.current.stop();
     };
   }, [inMeeting]);
@@ -266,17 +493,26 @@ export default function App() {
     return peer;
   }
 
-  const handleJoin = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (roomId.trim()) {
-      setInMeeting(true);
-    }
-  };
-
   const handleCreate = () => {
     const newId = Math.random().toString(36).substring(2, 10);
     setRoomId(newId);
     setInMeeting(true);
+    localStorage.setItem('lastRoomId', newId);
+  };
+
+  const handleJoin = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (roomId.trim()) {
+      setInMeeting(true);
+      localStorage.setItem('lastRoomId', roomId);
+    }
+  };
+
+  const handleRejoin = () => {
+    if (lastRoomId) {
+      setRoomId(lastRoomId);
+      setInMeeting(true);
+    }
   };
 
   const generateLink = () => {
@@ -302,60 +538,206 @@ export default function App() {
     }
   };
 
-  const toggleScreenShare = async () => {
-    if (!isScreenSharing) {
-      try {
-        const screenStream = await navigator.mediaDevices.getDisplayMedia({ video: true });
-        screenStreamRef.current = screenStream;
-        const screenTrack = screenStream.getVideoTracks()[0];
+  const refreshMedia = async () => {
+    if (stream) {
+      stream.getTracks().forEach(track => track.stop());
+    }
+    
+    try {
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const hasVideo = devices.some(device => device.kind === 'videoinput');
+      const hasAudio = devices.some(device => device.kind === 'audioinput');
 
-        // Replace track for all peers
-        peersRef.current.forEach(({ peer }) => {
-          const videoTrack = stream?.getVideoTracks()[0];
-          if (videoTrack) {
-            peer.replaceTrack(videoTrack, screenTrack, stream!);
-          }
-        });
+      const newStream = await navigator.mediaDevices.getUserMedia({
+        video: hasVideo ? {
+          facingMode: 'user',
+          width: { ideal: 640 },
+          height: { ideal: 480 }
+        } : false,
+        audio: hasAudio
+      });
 
-        // Update local video
-        if (userVideo.current) {
-          userVideo.current.srcObject = screenStream;
+      setStream(newStream);
+      if (userVideo.current) {
+        userVideo.current.srcObject = newStream;
+      }
+
+      // Update tracks for all peers
+      peersRef.current.forEach(({ peer }) => {
+        const oldVideoTrack = stream?.getVideoTracks()[0];
+        const newVideoTrack = newStream.getVideoTracks()[0];
+        if (oldVideoTrack && newVideoTrack) {
+          peer.replaceTrack(oldVideoTrack, newVideoTrack, newStream);
         }
 
-        setIsScreenSharing(true);
-
-        // Handle when user stops sharing via browser UI
-        screenTrack.onended = () => {
-          stopScreenShare();
-        };
-      } catch (error) {
-        console.error("Error sharing screen:", error);
-      }
-    } else {
-      stopScreenShare();
+        const oldAudioTrack = stream?.getAudioTracks()[0];
+        const newAudioTrack = newStream.getAudioTracks()[0];
+        if (oldAudioTrack && newAudioTrack) {
+          peer.replaceTrack(oldAudioTrack, newAudioTrack, newStream);
+        }
+      });
+    } catch (err) {
+      console.error("Error refreshing media:", err);
     }
   };
 
-  const stopScreenShare = () => {
-    if (screenStreamRef.current) {
-      screenStreamRef.current.getTracks().forEach(track => track.stop());
-    }
-    
-    const videoTrack = stream?.getVideoTracks()[0];
-    const screenTrack = screenStreamRef.current?.getVideoTracks()[0];
+  const toggleHandRaise = () => {
+    const newState = !isHandRaised;
+    setIsHandRaised(newState);
+    socket.emit('hand-raise', { roomId, isHandRaised: newState });
+  };
 
-    if (videoTrack && screenTrack) {
-      peersRef.current.forEach(({ peer }) => {
-        peer.replaceTrack(screenTrack, videoTrack, stream!);
+  const muteAll = () => {
+    if (!isHost) return;
+    socket.emit('host-action', { roomId, action: 'mute-all' });
+  };
+
+  const stopVideoAll = () => {
+    if (!isHost) return;
+    socket.emit('host-action', { roomId, action: 'stop-video-all' });
+  };
+
+  const endMeetingForAll = () => {
+    if (!isHost) return;
+    setConfirmDialog({
+      title: "End Meeting for All?",
+      message: "This will disconnect everyone from the meeting.",
+      onConfirm: () => {
+        socket.emit('host-action', { roomId, action: 'end-meeting' });
+        handleLeave();
+      }
+    });
+  };
+
+  const sendReaction = (emoji: string) => {
+    socket.emit('reaction', { roomId, emoji });
+  };
+
+  const startRecording = async () => {
+    try {
+      const screenStream = await navigator.mediaDevices.getDisplayMedia({
+        video: true,
+        audio: true
+      });
+      
+      const recorder = new MediaRecorder(screenStream, { mimeType: 'video/webm' });
+      mediaRecorderRef.current = recorder;
+      recordedChunksRef.current = [];
+
+      recorder.ondataavailable = (e) => {
+        if (e.data.size > 0) {
+          recordedChunksRef.current.push(e.data);
+        }
+      };
+
+      recorder.onstop = () => {
+        const blob = new Blob(recordedChunksRef.current, { type: 'video/webm' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `lumina-meet-recording-${new Date().toISOString()}.webm`;
+        a.click();
+        URL.revokeObjectURL(url);
+        setIsRecording(false);
+        screenStream.getTracks().forEach(track => track.stop());
+      };
+
+      recorder.start();
+      setIsRecording(true);
+    } catch (err) {
+      console.error("Error starting recording:", err);
+    }
+  };
+
+  const stopRecording = () => {
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+      mediaRecorderRef.current.stop();
+    }
+  };
+
+  const toggleScreenShare = async () => {
+    if (!isScreenSharing) {
+      setConfirmDialog({
+        title: "Start Screen Sharing?",
+        message: "This will replace your camera feed with your screen for all participants.",
+        onConfirm: async () => {
+          setConfirmDialog(null);
+          try {
+            const screenStream = await navigator.mediaDevices.getDisplayMedia({ video: true });
+            screenStreamRef.current = screenStream;
+            const screenTrack = screenStream.getVideoTracks()[0];
+
+            // Replace track for all peers
+            peersRef.current.forEach(({ peer }) => {
+              const videoTrack = stream?.getVideoTracks()[0];
+              if (videoTrack) {
+                peer.replaceTrack(videoTrack, screenTrack, stream!);
+              }
+            });
+
+            // Update local video
+            if (userVideo.current) {
+              userVideo.current.srcObject = screenStream;
+            }
+
+            setIsScreenSharing(true);
+
+            // Handle when user stops sharing via browser UI
+            screenTrack.onended = () => {
+              stopScreenShare(false); // No confirm if stopped by browser
+            };
+          } catch (error) {
+            console.error("Error sharing screen:", error);
+          }
+        }
+      });
+    } else {
+      setConfirmDialog({
+        title: "Stop Screen Sharing?",
+        message: "Your camera feed will be restored.",
+        onConfirm: () => {
+          setConfirmDialog(null);
+          stopScreenShare(false);
+        }
       });
     }
+  };
 
-    if (userVideo.current) {
-      userVideo.current.srcObject = stream;
+  const stopScreenShare = (shouldConfirm = true) => {
+    const executeStop = () => {
+      if (screenStreamRef.current) {
+        screenStreamRef.current.getTracks().forEach(track => track.stop());
+      }
+      
+      const videoTrack = stream?.getVideoTracks()[0];
+      const screenTrack = screenStreamRef.current?.getVideoTracks()[0];
+
+      if (videoTrack && screenTrack) {
+        peersRef.current.forEach(({ peer }) => {
+          peer.replaceTrack(screenTrack, videoTrack, stream!);
+        });
+      }
+
+      if (userVideo.current) {
+        userVideo.current.srcObject = stream;
+      }
+
+      setIsScreenSharing(false);
+      screenStreamRef.current = null;
+    };
+
+    if (shouldConfirm) {
+      setConfirmDialog({
+        title: "Stop Screen Sharing?",
+        message: "Your camera feed will be restored.",
+        onConfirm: () => {
+          setConfirmDialog(null);
+          executeStop();
+        }
+      });
+    } else {
+      executeStop();
     }
-
-    setIsScreenSharing(false);
-    screenStreamRef.current = null;
   };
 
   const sendMessage = (e: React.FormEvent) => {
@@ -382,33 +764,53 @@ export default function App() {
     setTimeout(() => setCopied(false), 2000);
   };
 
+  const handleLeave = () => {
+    window.location.reload();
+  };
+
+  const formatTime = (seconds: number) => {
+    const mins = Math.floor(seconds / 60);
+    const secs = seconds % 60;
+    return `${mins}:${secs.toString().padStart(2, '0')}`;
+  };
+
   if (!inMeeting) {
     return (
-      <div className="min-h-screen bg-[#0a0a0a] text-white flex flex-col items-center justify-center p-6 font-sans">
+      <div className="min-h-screen bg-[#0a0a0a] text-white flex flex-col items-center lg:justify-center justify-start pt-12 lg:pt-0 p-6 font-sans overflow-y-auto">
         <motion.div 
           initial={{ opacity: 0, y: 20 }}
           animate={{ opacity: 1, y: 0 }}
-          className="max-w-md w-full space-y-8 text-center"
+          className="max-w-md w-full space-y-6 lg:space-y-8 text-center"
         >
           <div className="flex justify-center">
-            <div className="w-16 h-16 bg-blue-600 rounded-2xl flex items-center justify-center shadow-lg shadow-blue-500/20">
-              <Video className="w-8 h-8" />
+            <div className="w-12 h-12 lg:w-16 lg:h-16 bg-blue-600 rounded-2xl flex items-center justify-center shadow-lg shadow-blue-500/20">
+              <Video className="w-6 h-6 lg:w-8 lg:h-8" />
             </div>
           </div>
           
           <div className="space-y-2">
-            <h1 className="text-4xl font-bold tracking-tight">Lumina Meet</h1>
-            <p className="text-gray-400">Professional video calls with AI-powered minutes.</p>
+            <h1 className="text-3xl lg:text-4xl font-bold tracking-tight">Lumina Meet</h1>
+            <p className="text-sm lg:text-base text-gray-400">Professional video calls with AI-powered minutes.</p>
           </div>
 
-          <div className="grid gap-4 pt-4">
+          <div className="grid gap-3 lg:gap-4 pt-4">
             <button 
               onClick={handleCreate}
-              className="w-full py-4 bg-blue-600 hover:bg-blue-700 rounded-xl font-semibold transition-all flex items-center justify-center gap-2"
+              className="w-full py-3 lg:py-4 bg-blue-600 hover:bg-blue-700 rounded-xl font-semibold transition-all flex items-center justify-center gap-2"
             >
               <Video className="w-5 h-5" />
               New Meeting
             </button>
+
+            {lastRoomId && (
+              <button 
+                onClick={handleRejoin}
+                className="w-full py-3 lg:py-4 bg-green-600/10 border border-green-500/20 hover:bg-green-600/20 text-green-400 rounded-xl font-semibold transition-all flex items-center justify-center gap-2"
+              >
+                <RefreshCw className="w-5 h-5" />
+                <span className="truncate">Rejoin ({lastRoomId})</span>
+              </button>
+            )}
 
             <button 
               onClick={generateLink}
@@ -503,24 +905,40 @@ export default function App() {
   return (
     <div className="h-screen bg-[#050505] text-white flex flex-col overflow-hidden font-sans">
       {/* Header */}
-      <header className="h-16 border-b border-gray-900 flex items-center justify-between px-6 bg-[#0a0a0a]/80 backdrop-blur-md z-10">
-        <div className="flex items-center gap-4">
-          <div className="w-8 h-8 bg-blue-600 rounded-lg flex items-center justify-center">
+      <header className="h-14 md:h-16 border-b border-gray-900 flex items-center justify-between px-4 md:px-6 bg-[#0a0a0a]/80 backdrop-blur-md z-10">
+        <div className="flex items-center gap-2 md:gap-4">
+          <div className="w-8 h-8 bg-blue-600 rounded-lg flex items-center justify-center shrink-0">
             <Video className="w-4 h-4" />
           </div>
-          <div>
-            <h2 className="font-semibold text-gray-200">Lumina Meet</h2>
+          <div className="min-w-0">
+            <h2 className="font-semibold text-gray-200 text-sm md:text-base truncate">Lumina Meet</h2>
             <div className="flex items-center gap-2">
-              <span className="text-[10px] text-gray-500 font-mono uppercase tracking-widest">Room: {roomId}</span>
+              <span className="text-[9px] md:text-[10px] text-gray-500 font-mono uppercase tracking-widest truncate max-w-[80px] md:max-w-none">Room: {roomId}</span>
               <div className={cn(
-                "w-1.5 h-1.5 rounded-full",
+                "w-1.5 h-1.5 rounded-full shrink-0",
                 isConnected ? "bg-green-500 shadow-[0_0_8px_rgba(34,197,94,0.5)]" : "bg-red-500 animate-pulse"
               )} />
             </div>
           </div>
+          {meetingStartTime && (
+            <div className={cn(
+              "ml-2 md:ml-4 px-2 md:px-3 py-1 rounded-full text-[10px] md:text-xs font-bold font-mono flex items-center gap-1.5 md:gap-2 border",
+              timeLeft < 300 ? "bg-red-500/10 border-red-500/50 text-red-500 animate-pulse" : "bg-gray-800 border-gray-700 text-gray-400"
+            )}>
+              <CircleDot className={cn("w-2.5 h-2.5 md:w-3 md:h-3", timeLeft < 300 ? "text-red-500" : "text-gray-500")} />
+              {formatTime(timeLeft)}
+            </div>
+          )}
         </div>
 
-        <div className="flex items-center gap-3">
+        <div className="flex items-center gap-1 md:gap-3">
+          <button 
+            onClick={refreshMedia}
+            className="p-2 rounded-lg transition-all hover:bg-gray-800 text-gray-400 hidden sm:block"
+            title="Refresh Camera/Mic"
+          >
+            <RefreshCw className="w-5 h-5" />
+          </button>
           <button 
             onClick={() => setShowChat(!showChat)}
             className={cn(
@@ -557,50 +975,185 @@ export default function App() {
       {/* Main Content */}
       <main className="flex-1 flex overflow-hidden relative">
         <div className={cn(
-          "flex-1 p-4 grid gap-4 auto-rows-fr",
-          layout === 'grid' 
-            ? `grid-cols-1 md:grid-cols-2 lg:grid-cols-${Math.min(3, Math.ceil(Math.sqrt(peers.length + 1)))}`
-            : "grid-cols-1"
+          "flex-1 p-2 md:p-4 flex flex-col overflow-hidden",
         )}>
-          {/* User Video */}
-          <div className="relative rounded-2xl overflow-hidden bg-gray-900 border border-gray-800 group shadow-2xl">
-            <video 
-              ref={userVideo} 
-              autoPlay 
-              muted 
-              playsInline 
-              className={cn("w-full h-full object-cover", isVideoOff && "hidden")} 
-            />
-            {isVideoOff && (
-              <div className="absolute inset-0 flex items-center justify-center bg-gray-900">
-                <div className="w-24 h-24 rounded-full bg-gray-800 flex items-center justify-center text-3xl font-bold">
-                  You
-                </div>
-              </div>
-            )}
-            <div className="absolute bottom-4 left-4 bg-black/50 backdrop-blur-md px-3 py-1 rounded-lg text-xs font-medium border border-white/10">
-              You {isMuted && "(Muted)"}
+          <div className={cn(
+            "flex-1 grid gap-2 md:gap-4 overflow-y-auto",
+            pinnedParticipantId 
+              ? "grid-cols-1 lg:grid-cols-[1fr_300px]" 
+              : layout === 'grid' 
+                ? `grid-cols-${Math.min(peers.length + 1, 2) > 1 ? '2' : '1'} md:grid-cols-2 lg:grid-cols-${Math.min(3, Math.ceil(Math.sqrt(Math.min(peers.length + 1, 9))))}`
+                : "grid-cols-1"
+          )}>
+            {/* Main Video Area (Pinned or Grid) */}
+            <div className={cn(
+              "grid gap-4",
+              pinnedParticipantId ? "grid-cols-1" : "contents"
+            )}>
+              {pinnedParticipantId ? (
+                // Render pinned participant
+                peers.find(p => p.peerId === pinnedParticipantId) ? (
+                  <VideoCard 
+                    key={pinnedParticipantId} 
+                    peer={peers.find(p => p.peerId === pinnedParticipantId).peer} 
+                    peerId={pinnedParticipantId} 
+                    isHandRaised={raisedHands.has(pinnedParticipantId)}
+                    isPinned={true}
+                    onPin={() => setPinnedParticipantId(null)}
+                  />
+                ) : (
+                  // If pinned user left, reset
+                  (() => { setPinnedParticipantId(null); return null; })()
+                )
+              ) : (
+                // Normal Grid View with Pagination
+                <>
+                  {(() => {
+                    const allParticipants = [
+                      { id: 'me', isMe: true },
+                      ...peers.map(p => ({ id: p.peerId, isMe: false, peer: p.peer }))
+                    ];
+                    const itemsPerPage = 9;
+                    const totalPages = Math.ceil(allParticipants.length / itemsPerPage);
+                    const startIdx = currentPage * itemsPerPage;
+                    const pageItems = allParticipants.slice(startIdx, startIdx + itemsPerPage);
+
+                    return (
+                      <>
+                        {pageItems.map((item) => (
+                          item.isMe ? (
+                            <div key="me" className="relative rounded-2xl overflow-hidden bg-gray-900 border border-gray-800 group shadow-2xl aspect-video">
+                              <video 
+                                ref={userVideo} 
+                                autoPlay 
+                                muted 
+                                playsInline 
+                                className={cn("w-full h-full object-cover", isVideoOff && "hidden")} 
+                              />
+                              {isVideoOff && (
+                                <div className="absolute inset-0 flex items-center justify-center bg-gray-900">
+                                  <div className="w-24 h-24 rounded-full bg-gray-800 flex items-center justify-center text-3xl font-bold">
+                                    You
+                                  </div>
+                                </div>
+                              )}
+                              <div className="absolute bottom-4 left-4 bg-black/50 backdrop-blur-md px-3 py-1 rounded-lg text-xs font-medium border border-white/10">
+                                You {isMuted && "(Muted)"}
+                              </div>
+                              {isHandRaised && (
+                                <div className="absolute top-4 right-4 bg-yellow-500 text-black p-2 rounded-full shadow-lg animate-bounce">
+                                  <Hand className="w-4 h-4" />
+                                </div>
+                              )}
+                            </div>
+                          ) : (
+                            <VideoCard 
+                              key={item.id} 
+                              peer={(item as any).peer} 
+                              peerId={item.id} 
+                              isHandRaised={raisedHands.has(item.id)}
+                              isPinned={false}
+                              onPin={() => setPinnedParticipantId(item.id)}
+                            />
+                          )
+                        ))}
+                        
+                        {totalPages > 1 && (
+                          <div className="absolute bottom-4 left-1/2 -translate-x-1/2 flex items-center gap-4 bg-black/60 backdrop-blur-md px-4 py-2 rounded-full border border-white/10 z-20">
+                            <button 
+                              disabled={currentPage === 0}
+                              onClick={() => setCurrentPage(prev => prev - 1)}
+                              className="p-1 hover:bg-white/10 rounded-full disabled:opacity-30"
+                            >
+                              <RefreshCw className="w-4 h-4 rotate-180" />
+                            </button>
+                            <span className="text-xs font-medium">Page {currentPage + 1} of {totalPages}</span>
+                            <button 
+                              disabled={currentPage === totalPages - 1}
+                              onClick={() => setCurrentPage(prev => prev + 1)}
+                              className="p-1 hover:bg-white/10 rounded-full disabled:opacity-30"
+                            >
+                              <RefreshCw className="w-4 h-4" />
+                            </button>
+                          </div>
+                        )}
+                      </>
+                    );
+                  })()}
+                </>
+              )}
             </div>
           </div>
 
-          {/* Peer Videos */}
-          {peers.map((peerObj) => (
-            <VideoCard key={peerObj.peerId} peer={peerObj.peer} peerId={peerObj.peerId} />
-          ))}
+          {/* Sidebar for other participants when pinned */}
+          {pinnedParticipantId && (
+            <div className="hidden lg:flex flex-col gap-4 overflow-y-auto pr-2">
+              {/* User Video in Sidebar */}
+              <div className="relative rounded-xl overflow-hidden bg-gray-900 border border-gray-800 group shadow-lg aspect-video shrink-0">
+                <video 
+                  ref={userVideo} 
+                  autoPlay 
+                  muted 
+                  playsInline 
+                  className={cn("w-full h-full object-cover", isVideoOff && "hidden")} 
+                />
+                {isVideoOff && (
+                  <div className="absolute inset-0 flex items-center justify-center bg-gray-900">
+                    <div className="w-12 h-12 rounded-full bg-gray-800 flex items-center justify-center text-sm font-bold">
+                      You
+                    </div>
+                  </div>
+                )}
+                <div className="absolute bottom-2 left-2 bg-black/50 backdrop-blur-md px-2 py-0.5 rounded text-[10px] font-medium border border-white/10">
+                  You
+                </div>
+              </div>
+
+              {/* Other Peers in Sidebar */}
+              {peers.filter(p => p.peerId !== pinnedParticipantId).map((peerObj) => (
+                <VideoCard 
+                  key={peerObj.peerId} 
+                  peer={peerObj.peer} 
+                  peerId={peerObj.peerId} 
+                  isHandRaised={raisedHands.has(peerObj.peerId)}
+                  isPinned={false}
+                  onPin={() => setPinnedParticipantId(peerObj.peerId)}
+                />
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* Floating Reactions */}
+        <div className="fixed inset-0 pointer-events-none z-50 overflow-hidden">
+          <AnimatePresence>
+            {reactions.map((reaction) => (
+              <motion.div
+                key={reaction.id}
+                initial={{ y: '100vh', x: `${Math.random() * 80 + 10}vw`, opacity: 0, scale: 0.5 }}
+                animate={{ y: '-10vh', opacity: 1, scale: 1.5 }}
+                exit={{ opacity: 0 }}
+                transition={{ duration: 3, ease: "easeOut" }}
+                className="absolute text-2xl md:text-4xl"
+              >
+                {reaction.emoji}
+              </motion.div>
+            ))}
+          </AnimatePresence>
         </div>
 
         {/* Side Panels */}
         <AnimatePresence>
           {showChat && (
             <motion.aside 
-              initial={{ x: 400 }}
+              initial={{ x: '100%' }}
               animate={{ x: 0 }}
-              exit={{ x: 400 }}
-              className="w-96 border-l border-gray-900 bg-[#0a0a0a] flex flex-col shadow-2xl"
+              exit={{ x: '100%' }}
+              className="fixed inset-0 lg:relative lg:inset-auto lg:w-96 border-l border-gray-900 bg-[#0a0a0a] flex flex-col shadow-2xl z-50"
             >
               <div className="p-4 border-b border-gray-900 flex items-center justify-between">
                 <h3 className="font-semibold">In-call Messages</h3>
-                <button onClick={() => setShowChat(false)} className="text-gray-500 hover:text-white">×</button>
+                <button onClick={() => setShowChat(false)} className="p-2 text-gray-500 hover:text-white text-2xl">×</button>
               </div>
               <div className="flex-1 overflow-y-auto p-4 space-y-4">
                 {messages.map((msg, i) => (
@@ -620,7 +1173,7 @@ export default function App() {
                   </div>
                 ))}
               </div>
-              <form onSubmit={sendMessage} className="p-4 border-t border-gray-900 flex gap-2">
+              <form onSubmit={sendMessage} className="p-4 pb-8 lg:pb-4 border-t border-gray-900 flex gap-2">
                 <input 
                   type="text" 
                   placeholder="Send a message..."
@@ -637,25 +1190,25 @@ export default function App() {
 
           {showAI && (
             <motion.aside 
-              initial={{ x: 400 }}
+              initial={{ x: '100%' }}
               animate={{ x: 0 }}
-              exit={{ x: 400 }}
-              className="w-96 border-l border-gray-900 bg-[#0a0a0a] flex flex-col shadow-2xl"
+              exit={{ x: '100%' }}
+              className="fixed inset-0 lg:relative lg:inset-auto lg:w-96 border-l border-gray-900 bg-[#0a0a0a] flex flex-col shadow-2xl z-50"
             >
               <div className="p-4 border-b border-gray-900 flex items-center justify-between">
                 <div className="flex items-center gap-2">
                   <Sparkles className="w-4 h-4 text-purple-400" />
-                  <h3 className="font-semibold">AI Meeting Assistant</h3>
+                  <h3 className="font-semibold">AI Assistant</h3>
                 </div>
-                <button onClick={() => setShowAI(false)} className="text-gray-500 hover:text-white">×</button>
+                <button onClick={() => setShowAI(false)} className="p-2 text-gray-500 hover:text-white text-2xl">×</button>
               </div>
               
-              <div className="flex-1 overflow-y-auto p-4 space-y-6">
+              <div className="flex-1 overflow-y-auto p-4 space-y-6 pb-20 lg:pb-4">
                 {!minutes ? (
                   <div className="space-y-4">
                     <div className="p-4 bg-purple-900/10 border border-purple-500/20 rounded-xl">
                       <p className="text-sm text-purple-200">
-                        I'm listening to the meeting. Click below to generate professional minutes from the transcript.
+                        I'm listening. Generate professional minutes from the transcript.
                       </p>
                     </div>
                     <div className="space-y-2">
@@ -729,15 +1282,42 @@ export default function App() {
 
           {showParticipants && (
             <motion.aside 
-              initial={{ x: 400 }}
+              initial={{ x: '100%' }}
               animate={{ x: 0 }}
-              exit={{ x: 400 }}
-              className="w-96 border-l border-gray-900 bg-[#0a0a0a] flex flex-col shadow-2xl"
+              exit={{ x: '100%' }}
+              className="fixed inset-0 lg:relative lg:inset-auto lg:w-96 border-l border-gray-900 bg-[#0a0a0a] flex flex-col shadow-2xl z-50"
             >
               <div className="p-4 border-b border-gray-900 flex items-center justify-between">
                 <h3 className="font-semibold">Participants ({peers.length + 1})</h3>
-                <button onClick={() => setShowParticipants(false)} className="text-gray-500 hover:text-white">×</button>
+                <button onClick={() => setShowParticipants(false)} className="p-2 text-gray-500 hover:text-white text-2xl">×</button>
               </div>
+              
+              {isHost && (
+                <div className="p-4 border-b border-gray-900 grid grid-cols-3 gap-2">
+                  <button 
+                    onClick={muteAll}
+                    className="flex flex-col items-center gap-1 p-2 rounded-lg bg-gray-900 hover:bg-gray-800 transition-colors border border-gray-800"
+                  >
+                    <MicOff className="w-4 h-4 text-red-500" />
+                    <span className="text-[10px] text-gray-400">Mute All</span>
+                  </button>
+                  <button 
+                    onClick={stopVideoAll}
+                    className="flex flex-col items-center gap-1 p-2 rounded-lg bg-gray-900 hover:bg-gray-800 transition-colors border border-gray-800"
+                  >
+                    <VideoOff className="w-4 h-4 text-red-500" />
+                    <span className="text-[10px] text-gray-400">Stop Video</span>
+                  </button>
+                  <button 
+                    onClick={endMeetingForAll}
+                    className="flex flex-col items-center gap-1 p-2 rounded-lg bg-red-900/10 hover:bg-red-900/20 transition-colors border border-red-900/30"
+                  >
+                    <PhoneOff className="w-4 h-4 text-red-500" />
+                    <span className="text-[10px] text-red-400">End All</span>
+                  </button>
+                </div>
+              )}
+
               <div className="flex-1 overflow-y-auto p-4 space-y-2">
                 <div className="flex items-center justify-between p-3 bg-gray-900/50 rounded-xl border border-gray-800">
                   <div className="flex items-center gap-3">
@@ -766,63 +1346,139 @@ export default function App() {
       </main>
 
       {/* Controls */}
-      <footer className="h-24 bg-[#0a0a0a] border-t border-gray-900 flex items-center justify-center px-6 gap-4 z-10">
-        <div className="flex items-center gap-4">
+      <footer className="h-20 md:h-24 bg-[#0a0a0a] border-t border-gray-900 flex items-center justify-center px-4 md:px-6 gap-2 md:gap-4 z-10">
+        <div className="flex items-center gap-2 md:gap-3 lg:gap-4">
           <button 
             onClick={toggleMute}
             className={cn(
-              "w-12 h-12 rounded-full flex items-center justify-center transition-all border",
+              "w-10 h-10 md:w-12 md:h-12 rounded-full flex items-center justify-center transition-all border",
               isMuted ? "bg-red-500/10 border-red-500/50 text-red-500" : "bg-gray-800 border-gray-700 text-white hover:bg-gray-700"
             )}
           >
-            {isMuted ? <MicOff className="w-5 h-5" /> : <Mic className="w-5 h-5" />}
+            {isMuted ? <MicOff className="w-4 h-4 md:w-5 md:h-5" /> : <Mic className="w-4 h-4 md:w-5 md:h-5" />}
           </button>
           
           <button 
             onClick={toggleVideo}
             className={cn(
-              "w-12 h-12 rounded-full flex items-center justify-center transition-all border",
+              "w-10 h-10 md:w-12 md:h-12 rounded-full flex items-center justify-center transition-all border",
               isVideoOff ? "bg-red-500/10 border-red-500/50 text-red-500" : "bg-gray-800 border-gray-700 text-white hover:bg-gray-700"
             )}
           >
-            {isVideoOff ? <VideoOff className="w-5 h-5" /> : <Video className="w-5 h-5" />}
+            {isVideoOff ? <VideoOff className="w-4 h-4 md:w-5 md:h-5" /> : <Video className="w-4 h-4 md:w-5 md:h-5" />}
           </button>
 
           <button 
             onClick={toggleScreenShare}
             className={cn(
-              "w-12 h-12 rounded-full flex items-center justify-center transition-all border",
+              "w-10 h-10 md:w-12 md:h-12 rounded-full flex items-center justify-center transition-all border hidden sm:flex",
               isScreenSharing ? "bg-blue-500/10 border-blue-500/50 text-blue-400" : "bg-gray-800 border-gray-700 text-white hover:bg-gray-700"
             )}
           >
-            {isScreenSharing ? <MonitorOff className="w-5 h-5" /> : <Monitor className="w-5 h-5" />}
+            {isScreenSharing ? <MonitorOff className="w-4 h-4 md:w-5 md:h-5" /> : <Monitor className="w-4 h-4 md:w-5 md:h-5" />}
           </button>
 
           <button 
-            onClick={() => setLayout(layout === 'grid' ? 'focus' : 'grid')}
-            className="w-12 h-12 rounded-full bg-gray-800 border border-gray-700 flex items-center justify-center hover:bg-gray-700 transition-all"
+            onClick={toggleHandRaise}
+            className={cn(
+              "w-10 h-10 md:w-12 md:h-12 rounded-full flex items-center justify-center transition-all border",
+              isHandRaised ? "bg-yellow-500/10 border-yellow-500/50 text-yellow-500" : "bg-gray-800 border-gray-700 text-white hover:bg-gray-700"
+            )}
           >
-            <LayoutGrid className="w-5 h-5" />
+            <Hand className="w-4 h-4 md:w-5 md:h-5" />
           </button>
 
-          <div className="w-[1px] h-8 bg-gray-800 mx-2" />
+          <div className="relative group/reactions">
+            <button className="w-10 h-10 md:w-12 md:h-12 rounded-full bg-gray-800 border border-gray-700 text-white flex items-center justify-center hover:bg-gray-700 transition-all">
+              <Smile className="w-4 h-4 md:w-5 md:h-5" />
+            </button>
+            <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-4 p-2 bg-gray-900 border border-gray-800 rounded-2xl shadow-2xl flex gap-1 md:gap-2 opacity-0 pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto group-active:opacity-100 group-active:pointer-events-auto transition-all">
+              {['❤️', '👍', '🎉', '👏', '😮', '🔥'].map(emoji => (
+                <button 
+                  key={emoji}
+                  onClick={() => sendReaction(emoji)}
+                  className="w-8 h-8 md:w-10 md:h-10 flex items-center justify-center hover:bg-gray-800 rounded-xl transition-all text-lg md:text-xl"
+                >
+                  {emoji}
+                </button>
+              ))}
+            </div>
+          </div>
 
           <button 
-            onClick={() => window.location.reload()}
-            className="px-6 h-12 bg-red-600 hover:bg-red-700 rounded-full font-semibold flex items-center gap-2 transition-all shadow-lg shadow-red-500/20"
+            onClick={() => setIsAdvancedAudio(!isAdvancedAudio)}
+            className={cn(
+              "w-10 h-10 md:w-12 md:h-12 rounded-full flex items-center justify-center transition-all border",
+              isAdvancedAudio ? "bg-purple-500/10 border-purple-500/50 text-purple-400" : "bg-gray-800 border-gray-700 text-white hover:bg-gray-700"
+            )}
+            title={isAdvancedAudio ? "Disable Advanced Audio" : "Enable Advanced Audio (Noise Cancellation)"}
           >
-            <PhoneOff className="w-5 h-5" />
-            Leave
+            <Sparkles className="w-4 h-4 md:w-5 md:h-5" />
+          </button>
+
+          <button 
+            onClick={handleLeave}
+            className="w-10 h-10 md:w-12 md:h-12 rounded-full bg-red-600 flex items-center justify-center hover:bg-red-700 transition-all shadow-lg shadow-red-900/20"
+          >
+            <LogOut className="w-4 h-4 md:w-5 md:h-5" />
           </button>
         </div>
       </footer>
+
+      {/* Confirmation Dialog */}
+      <AnimatePresence>
+        {confirmDialog && (
+          <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm">
+            <motion.div 
+              initial={{ scale: 0.9, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              exit={{ scale: 0.9, opacity: 0 }}
+              className="bg-gray-900 border border-gray-800 rounded-3xl p-6 max-w-sm w-full shadow-2xl"
+            >
+              <h3 className="text-xl font-bold mb-2">{confirmDialog.title}</h3>
+              <p className="text-gray-400 text-sm mb-6 leading-relaxed">
+                {confirmDialog.message}
+              </p>
+              <div className="flex gap-3">
+                <button 
+                  onClick={() => setConfirmDialog(null)}
+                  className="flex-1 py-3 rounded-xl bg-gray-800 hover:bg-gray-700 font-medium transition-colors"
+                >
+                  Cancel
+                </button>
+                <button 
+                  onClick={confirmDialog.onConfirm}
+                  className="flex-1 py-3 rounded-xl bg-blue-600 hover:bg-blue-700 font-medium transition-colors"
+                >
+                  Confirm
+                </button>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
     </div>
   );
 }
 
-function VideoCard({ peer, peerId }: { peer: any, peerId: string }) {
+function VideoCard({ 
+  peer, 
+  peerId, 
+  isHandRaised, 
+  isPinned, 
+  onPin 
+}: { 
+  peer: any, 
+  peerId: string, 
+  isHandRaised?: boolean,
+  isPinned: boolean,
+  onPin: () => void
+}) {
   const ref = useRef<HTMLVideoElement>(null);
   const [hasStream, setHasStream] = useState(false);
+  const [isLocalMuted, setIsLocalMuted] = useState(false);
+  const [isLocalVideoOff, setIsLocalVideoOff] = useState(false);
+  const [showControls, setShowControls] = useState(false);
 
   useEffect(() => {
     const handleStream = (stream: MediaStream) => {
@@ -846,26 +1502,85 @@ function VideoCard({ peer, peerId }: { peer: any, peerId: string }) {
   }, [peer, peerId]);
 
   return (
-    <div className="relative rounded-2xl overflow-hidden bg-gray-900 border border-gray-800 group shadow-2xl aspect-video">
+    <div 
+      onClick={() => setShowControls(!showControls)}
+      className={cn(
+        "relative rounded-2xl overflow-hidden bg-gray-900 border border-gray-800 group shadow-2xl aspect-video transition-all duration-300 cursor-pointer",
+        isPinned && "ring-2 ring-blue-500"
+      )}
+    >
       <video 
         ref={ref} 
         autoPlay 
         playsInline 
-        className={cn("w-full h-full object-cover", !hasStream && "hidden")} 
+        muted={isLocalMuted}
+        className={cn("w-full h-full object-cover pointer-events-none", (!hasStream || isLocalVideoOff) && "hidden")} 
       />
-      {!hasStream && (
-        <div className="absolute inset-0 flex items-center justify-center bg-gray-900">
+      
+      {(!hasStream || isLocalVideoOff) && (
+        <div className="absolute inset-0 flex items-center justify-center bg-gray-900 pointer-events-none">
           <div className="flex flex-col items-center gap-3">
-            <div className="w-16 h-16 rounded-full bg-gray-800 flex items-center justify-center text-xl font-bold animate-pulse">
+            <div className="w-12 h-12 md:w-16 md:h-16 rounded-full bg-gray-800 flex items-center justify-center text-lg md:text-xl font-bold animate-pulse">
               {peerId.substring(0, 2).toUpperCase()}
             </div>
-            <span className="text-xs text-gray-500 font-medium">Connecting...</span>
+            <span className="text-[10px] md:text-xs text-gray-500 font-medium">
+              {!hasStream ? "Connecting..." : "Video Paused"}
+            </span>
           </div>
         </div>
       )}
-      <div className="absolute bottom-4 left-4 bg-black/50 backdrop-blur-md px-3 py-1 rounded-lg text-xs font-medium border border-white/10">
-        User {peerId.substring(0, 4)}
+
+      {/* Local Controls Overlay */}
+      <div 
+        onClick={(e) => e.stopPropagation()}
+        className={cn(
+          "absolute top-2 left-2 md:top-4 md:left-4 flex gap-1 md:gap-2 transition-opacity duration-200",
+          showControls ? "opacity-100" : "opacity-0 group-hover:opacity-100"
+        )}
+      >
+        <button 
+          onClick={() => setIsLocalMuted(!isLocalMuted)}
+          className={cn(
+            "p-1.5 md:p-2 rounded-lg backdrop-blur-md border transition-all",
+            isLocalMuted ? "bg-red-500/20 border-red-500/50 text-red-500" : "bg-black/40 border-white/10 text-white hover:bg-black/60"
+          )}
+          title={isLocalMuted ? "Unmute participant" : "Mute participant"}
+        >
+          {isLocalMuted ? <MicOff className="w-3.5 h-3.5 md:w-4 md:h-4" /> : <Mic className="w-3.5 h-3.5 md:w-4 md:h-4" />}
+        </button>
+        <button 
+          onClick={() => setIsLocalVideoOff(!isLocalVideoOff)}
+          className={cn(
+            "p-1.5 md:p-2 rounded-lg backdrop-blur-md border transition-all",
+            isLocalVideoOff ? "bg-red-500/20 border-red-500/50 text-red-500" : "bg-black/40 border-white/10 text-white hover:bg-black/60"
+          )}
+          title={isLocalVideoOff ? "Show video" : "Hide video"}
+        >
+          {isLocalVideoOff ? <VideoOff className="w-3.5 h-3.5 md:w-4 md:h-4" /> : <Video className="w-3.5 h-3.5 md:w-4 md:h-4" />}
+        </button>
+        <button 
+          onClick={onPin}
+          className={cn(
+            "p-1.5 md:p-2 rounded-lg backdrop-blur-md border transition-all",
+            isPinned ? "bg-blue-500/20 border-blue-500/50 text-blue-500" : "bg-black/40 border-white/10 text-white hover:bg-black/60"
+          )}
+          title={isPinned ? "Unpin participant" : "Pin participant"}
+        >
+          {isPinned ? <PinOff className="w-3.5 h-3.5 md:w-4 md:h-4" /> : <Pin className="w-3.5 h-3.5 md:w-4 md:h-4" />}
+        </button>
       </div>
+
+      <div className="absolute bottom-2 left-2 md:bottom-4 md:left-4 bg-black/50 backdrop-blur-md px-2 py-0.5 md:px-3 md:py-1 rounded-lg text-[10px] md:text-xs font-medium border border-white/10 flex items-center gap-1 md:gap-2 pointer-events-none">
+        <span className="truncate max-w-[80px] md:max-w-[100px]">User {peerId.substring(0, 4)}</span>
+        {isLocalMuted && <MicOff className="w-3 h-3 text-red-500" />}
+        {isPinned && <Pin className="w-3 h-3 text-blue-500" />}
+      </div>
+
+      {isHandRaised && (
+        <div className="absolute top-2 right-2 md:top-4 md:right-4 bg-yellow-500 text-black p-1.5 md:p-2 rounded-full shadow-lg animate-bounce pointer-events-none">
+          <Hand className="w-3.5 h-3.5 md:w-4 md:h-4" />
+        </div>
+      )}
     </div>
   );
 }
