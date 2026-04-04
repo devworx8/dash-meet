@@ -472,6 +472,14 @@ export default function App() {
           setPolls(updatedPolls);
         });
 
+        socket.on('server-error', ({ message }: { code: string; message: string }) => {
+          setConfirmDialog({
+            title: "Server Notice",
+            message,
+            onConfirm: () => setConfirmDialog(null)
+          });
+        });
+
         // Setup Speech Recognition for transcription
         const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
         if (SpeechRecognition) {
@@ -505,6 +513,14 @@ export default function App() {
       socket.off('new-message');
       socket.off('user-hand-raise');
       socket.off('new-reaction');
+      socket.off('remote-user-state-update');
+      socket.off('host-action');
+      socket.off('room-info');
+      socket.off('waiting-room-update');
+      socket.off('user-admitted');
+      socket.off('user-rejected');
+      socket.off('polls-update');
+      socket.off('server-error');
       if (recognitionRef.current) recognitionRef.current.stop();
     };
   }, [inMeeting]);
